@@ -1,0 +1,10 @@
+.git
+log/*
+tmp/*
+coverage
+__pycache__
+*.pyc
+Gemfile.lock
+*.docx
+*.html
+interview-handout*

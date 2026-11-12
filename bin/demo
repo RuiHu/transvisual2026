@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# One-command demo: start the stack, build the independent expected-state
+# snapshot, replay carrier_events.csv, and verify all 310 shipments.
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+
+SEED="${SEED:-42}"
+CONCURRENCY="${CONCURRENCY:-10}"
+RESET=1
+
+for arg in "$@"; do
+  case "$arg" in
+    --no-reset) RESET=0 ;;
+    -h|--help)
+      echo "usage: ./bin/demo [--no-reset]"
+      echo "  --no-reset  keep the existing database volume (replay becomes idempotent)"
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $arg" >&2
+      exit 2
+      ;;
+  esac
+done
+
+if [ "$RESET" -eq 1 ]; then
+  echo "[demo] resetting containers and volumes"
+  docker compose down -v
+fi
+
+echo "[demo] starting stack (build + wait for health)"
+docker compose up -d --build --wait
+
+echo "[demo] generating expected state from carrier_events.csv"
+docker compose exec -T app ruby bin/generate_expected.rb
+
+echo "[demo] replaying events (seed=$SEED concurrency=$CONCURRENCY)"
+docker compose exec -T -e SEED="$SEED" -e CONCURRENCY="$CONCURRENCY" app \
+  bin/rake replay:full
+
+echo "[demo] done — look for '310/310 shipments verified' above"

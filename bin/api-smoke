@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# API smoke test for a running service. Creates uniquely-tagged test rows;
+# it does not delete them (safe to run repeatedly against a demo database).
+set -euo pipefail
+
+BASE_URL="${BASE_URL:-http://localhost:3000}"
+RUN_ID="$(date +%s)-$$"
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+PASS=0
+FAIL=0
+
+pass() { echo "PASS  $1"; PASS=$((PASS + 1)); }
+fail() { echo "FAIL  $1"; FAIL=$((FAIL + 1)); }
+
+# call METHOD PATH [BODY] [CONTENT_TYPE] -> writes body to $TMP/body, echoes code
+call() {
+  local method="$1" path="$2" body="${3:-}" ctype="${4:-application/json}"
+  if [ -n "$body" ]; then
+    curl -s -o "$TMP/body" -w '%{http_code}' -X "$method" "$BASE_URL$path" \
+      -H "Content-Type: $ctype" -d "$body" || true
+  else
+    curl -s -o "$TMP/body" -w '%{http_code}' -X "$method" "$BASE_URL$path" || true
+  fi
+}
+
+expect_code() {
+  local name="$1" expected="$2" code="$3"
+  if [ "$code" = "$expected" ]; then
+    pass "$name ($code)"
+  else
+    fail "$name expected $expected got $code: $(cat "$TMP/body" 2>/dev/null || true)"
+  fi
+}
+
+expect_body() {
+  local name="$1" needle="$2"
+  if grep -q "$needle" "$TMP/body" 2>/dev/null; then
+    pass "$name"
+  else
+    fail "$name missing '$needle': $(cat "$TMP/body" 2>/dev/null || true)"
+  fi
+}
+
+echo "api-smoke: BASE_URL=$BASE_URL run=$RUN_ID"
+
+# 1. health
+code=$(call GET /health)
+expect_code "health" 200 "$code"
+expect_body "health body" '"status":"ok"'
+
+REF1="TV-SMOKE-$RUN_ID-A"
+EID1="smoke-$RUN_ID-1"
+code=$(call POST /api/v1/events "{\"event_id\":\"$EID1\",\"shipment_reference\":\"$REF1\",\"status\":\"created\",\"event_timestamp\":\"2026-07-01T00:00:00Z\"}")
+expect_code "single create" 201 "$code"
+
+# 2. duplicate + first-write-wins
+code=$(call POST /api/v1/events "{\"event_id\":\"$EID1\",\"shipment_reference\":\"$REF1\",\"status\":\"delivered\",\"event_timestamp\":\"2026-07-09T00:00:00Z\"}")
+expect_code "duplicate event_id" 200 "$code"
+expect_body "duplicate flag" '"duplicate":true'
+expect_body "first payload wins" '"status":"created"'
+
+call GET "/api/v1/shipments/$REF1/timeline" >/dev/null
+rows=$(grep -o "\"event_id\":\"$EID1\"" "$TMP/body" | wc -l | tr -d ' ')
+if [ "$rows" = "1" ]; then pass "duplicate stored once"; else fail "duplicate rows=$rows"; fi
+
+# 3. validation errors
+code=$(call POST /api/v1/events "{\"event_id\":\"smoke-$RUN_ID-missing\"}")
+expect_code "missing fields" 422 "$code"
+
+code=$(call POST /api/v1/events "{\"event_id\":\"smoke-$RUN_ID-tz\",\"shipment_reference\":\"$REF1\",\"status\":\"created\",\"event_timestamp\":\"2026-07-01T00:00:00+08:00\"}")
+expect_code "non-UTC timestamp" 422 "$code"
+
+code=$(call POST /api/v1/events "not-json" "text/plain")
+expect_code "non-JSON body" 400 "$code"
+
+# 4. batch idempotency
+REFB="TV-SMOKE-$RUN_ID-B"
+BATCH="{\"events\":[
+  {\"event_id\":\"smoke-$RUN_ID-b1\",\"shipment_reference\":\"$REFB\",\"status\":\"created\",\"event_timestamp\":\"2026-07-01T00:00:00Z\"},
+  {\"event_id\":\"smoke-$RUN_ID-b2\",\"shipment_reference\":\"$REFB\",\"status\":\"picked_up\",\"event_timestamp\":\"2026-07-02T00:00:00Z\"},
+  {\"event_id\":\"smoke-$RUN_ID-b1\",\"shipment_reference\":\"$REFB\",\"status\":\"created\",\"event_timestamp\":\"2026-07-01T00:00:00Z\"}]}"
+code=$(call POST /api/v1/events "$BATCH")
+expect_code "batch run 1" 200 "$code"
+expect_body "batch run 1 counts" '"accepted":3,"inserted":2,"duplicates":1'
+code=$(call POST /api/v1/events "$BATCH")
+expect_code "batch run 2" 200 "$code"
+expect_body "batch run 2 counts" '"accepted":3,"inserted":0,"duplicates":3'
+
+# 5. timeline ordering with out-of-order writes
+REFO="TV-SMOKE-$RUN_ID-C"
+call POST /api/v1/events "{\"event_id\":\"smoke-$RUN_ID-o3\",\"shipment_reference\":\"$REFO\",\"status\":\"delivered\",\"event_timestamp\":\"2026-07-03T12:00:00Z\"}" >/dev/null
+call POST /api/v1/events "{\"event_id\":\"smoke-$RUN_ID-o1\",\"shipment_reference\":\"$REFO\",\"status\":\"created\",\"event_timestamp\":\"2026-07-01T12:00:00Z\"}" >/dev/null
+call POST /api/v1/events "{\"event_id\":\"smoke-$RUN_ID-o2\",\"shipment_reference\":\"$REFO\",\"status\":\"picked_up\",\"event_timestamp\":\"2026-07-02T12:00:00Z\"}" >/dev/null
+code=$(call GET "/api/v1/shipments/$REFO/timeline")
+expect_code "timeline" 200 "$code"
+expect_body "timeline current_status" '"current_status":"delivered"'
+sequence=$(grep -o '"status":"[a-z_]*"' "$TMP/body" | tr '\n' ' ')
+if [ "$sequence" = '"status":"created" "status":"picked_up" "status":"delivered" ' ]; then
+  pass "timeline order"
+else
+  fail "timeline order: $sequence"
+fi
+
+# 6. list + status filter
+code=$(call GET "/api/v1/shipments?status=delivered")
+expect_code "list status=delivered" 200 "$code"
+expect_body "list contains new shipment" "$REFO"
+code=$(call GET "/api/v1/shipments?status=bogus")
+expect_code "invalid status filter" 400 "$code"
+
+# 7. unknown shipment
+code=$(call GET "/api/v1/shipments/TV-SMOKE-$RUN_ID-NOPE/timeline")
+expect_code "unknown shipment" 404 "$code"
+
+# 8. 12 concurrent identical posts
+REFC="TV-SMOKE-$RUN_ID-D"
+EIDC="smoke-$RUN_ID-conc"
+CONC="{\"event_id\":\"$EIDC\",\"shipment_reference\":\"$REFC\",\"status\":\"created\",\"event_timestamp\":\"2026-07-01T00:00:00Z\"}"
+for i in $(seq 1 12); do
+  curl -s -o /dev/null -w '%{http_code}\n' -X POST "$BASE_URL/api/v1/events" \
+    -H 'Content-Type: application/json' -d "$CONC" > "$TMP/code_$i" &
+done
+wait
+codes=$(cat "$TMP"/code_*)
+n201=$(printf '%s\n' "$codes" | grep -c '^201$' || true)
+n200=$(printf '%s\n' "$codes" | grep -c '^200$' || true)
+if [ "$n201" = "1" ] && [ "$n200" = "11" ]; then
+  pass "12 concurrent posts (1x201, 11x200)"
+else
+  fail "12 concurrent posts (201=$n201 200=$n200)"
+fi
+call GET "/api/v1/shipments/$REFC/timeline" >/dev/null
+conc_rows=$(grep -o "\"event_id\":\"$EIDC\"" "$TMP/body" | wc -l | tr -d ' ')
+if [ "$conc_rows" = "1" ]; then pass "concurrent duplicate stored once"; else fail "concurrent rows=$conc_rows"; fi
+
+echo ""
+echo "api-smoke result: pass=$PASS fail=$FAIL (run=$RUN_ID)"
+[ "$FAIL" -eq 0 ] || exit 1

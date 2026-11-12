@@ -1,0 +1,13 @@
+# Subjective terms banned in acceptance criteria (Constitution Clause 1)
+# One regex per line. Empty lines and #-comments ignored during scanning.
+good performance
+clean code
+correctly handled
+elegant
+robust
+should be
+ought to
+nice to have
+properly
+well designed
+reliable
