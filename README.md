@@ -1,6 +1,6 @@
 # Shipment Events Service
 
-> **See also:** [5-minute demo guide](DEMO.md) · [ADR](ADR.md) · [AI usage note](AI_USAGE.md)
+> **See also:**  [ADR](ADR.md) · [AI usage note](AI_USAGE.md)
 
 Ingests carrier shipment-tracking events (duplicates and out-of-order rows included)
 and serves an accurate shipment timeline with a derived current status.
